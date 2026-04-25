@@ -110,7 +110,7 @@ sudo nano Caddyfile
 
 Replace `YOUR_DOMAIN_HERE` with the same hostname as in `.env`.
 
-> **Why the Caddyfile is more than `reverse_proxy vaultwarden:80`** — see the comments at the top of `Caddyfile.example`. The short version: it's tuned to make vaultwarden's built-in diagnostics page (`/admin/diagnostics`) report green. Specifically it injects `X-Real-IP` / `X-Forwarded-For` so vaultwarden logs and rate-limits per real client (not per Caddy), it strips frame-blocking headers only on the 2FA endpoints so FIDO2 popups can render, and its CSP allow-lists `api.pwnedpasswords.com` (breach checks) and `api.2fa.directory` (2FA service catalog) — both of which the web vault calls into. There's also a `*.map` 404 rule that keeps browser DevTools quiet without polluting your access log.
+> **Why the Caddyfile is more than `reverse_proxy vaultwarden:80`** — see the comments at the top of `Caddyfile.example`. The short version: it's tuned to make vaultwarden's built-in diagnostics page (`/admin/diagnostics`) report green. Specifically it injects `X-Real-IP` / `X-Forwarded-For` so vaultwarden logs and rate-limits per real client (not per Caddy), it sets `Referrer-Policy: same-origin` (the diagnostics check looks for that exact substring — the more common `strict-origin-when-cross-origin` value fails the test), it strips frame-blocking headers only on the 2FA endpoints so FIDO2 popups can render, and its CSP allow-lists `api.pwnedpasswords.com` (breach checks) and `api.2fa.directory` (2FA service catalog) — both of which the web vault calls into. There's also a `*.map` 404 rule that keeps browser DevTools quiet without polluting your access log.
 
 2.6 **Bring up the stack:**
 

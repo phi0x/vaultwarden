@@ -22,11 +22,21 @@
 YOUR_DOMAIN_HERE {
     encode zstd gzip
 
-    # Global security headers
+    tls {
+        protocols tls1.2 tls1.3
+    }
+
+    # Global security headers. `Referrer-Policy: same-origin` is required by
+    # vaultwarden's /admin/diagnostics HTTP-response check — the test looks
+    # for the literal substring `same-origin` in the header value, so the
+    # otherwise-reasonable `strict-origin-when-cross-origin` fails the check.
+    # `same-origin` is also strictly more private (no referrer leaks at all
+    # on cross-origin requests), which is what you want for a password vault.
     header {
+        -server
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
-        Referrer-Policy "strict-origin-when-cross-origin"
+        Referrer-Policy "same-origin"
     }
 
     # 2FA / FIDO2 endpoints — popups need to be embeddable, so strip the
