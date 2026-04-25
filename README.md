@@ -1,216 +1,259 @@
-# bitwarden_rs
-A reference solution for bitwarden_rs
+# vaultwarden
 
-referenced: https://www.linode.com/docs/guides/how-to-self-host-the-bitwarden-rs-password-manager/ tutorial. Credits go to OP, forked tutorial and tweaked a bit.
+A reference solution for deploying [vaultwarden](https://github.com/dani-garcia/vaultwarden) (a Bitwarden-compatible server in Rust) on Ubuntu/Debian behind Caddy, with automated SQLite backups and offsite sync over SSH.
 
-1. Uninstall any potential docker setup files.
+> **Note on the rename:** This project was previously called `bitwarden_rs` and the upstream Docker image was `bitwardenrs/server`. In April 2021 the project was renamed to `vaultwarden` at the request of Bitwarden Inc. to avoid trademark confusion, and the canonical Docker image is now `vaultwarden/server`. This guide has been updated accordingly. If you are migrating an existing `bitwarden_rs` install, the data directory format is identical — you only need to switch the image and container name.
 
-`sudo apt-get remove docker docker-engine docker.io containerd runc`
+Originally adapted from the [Linode self-hosting guide](https://www.linode.com/docs/guides/how-to-self-host-the-bitwarden-rs-password-manager/), then modernized for current Docker, current Caddy, and the post-rename project.
 
-2. Install package prerequisites for compatibility with the upstream Docker repository.
+---
 
-`sudo apt-get install apt-transport-https ca-certificates curl gnupg-agent software-properties-common`
+## 1. Install Docker
 
-3. Add the official Docker GPG repository key.
-
-`sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -`
-
-4. Add the Docker upstream repository.
-
-`sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"`
-
-5. update apt-get
-
-`sudo apt-get update`
-
-6. Install required docker packages
-
-`sudo apt-get install docker-ce docker-ce-cli containerd.io`
-
-7. Start/enable docker daemon
-
-`sudo systemctl enable --now docker`
-
-8. confirm docker works
-
-`sudo docker ps`
-
-9. Pull the bitwarden_rs image.
-
-`sudo docker pull bitwardenrs/server:latest`
-
-10. Select the desired file system path to store application data. In this guide, the path /srv/bitwarden is used. Create the directory if necessary, and enforce strict permissions for the root user only.
+1.1 Remove any pre-existing docker packages:
 
 ```
-sudo mkdir /srv/bitwarden
-sudo chmod go-rwx /srv/bitwarden
+sudo apt-get remove docker docker-engine docker.io containerd runc
 ```
 
-11. Create the Docker container for bitwarden_rs with signups disabled and setup admin token along with setting U2F token domain. 
-note: Can generate an admin token with: 
-
-`openssl rand -base64 48`
+1.2 Install prerequisites:
 
 ```
-docker run -d --name bitwarden -v /srv/bitwarden:/data -e WEBSOCKET_ENABLED=true -e SIGNUPS_ALLOWED=false -e ADMIN_TOKEN="YOUR_TOKEN_HERE" -e DOMAIN=https://YOUR_DOMAIN_HERE -p 127.0.0.1:8080:80 -p 127.0.0.1:3012:3012 --restart on-failure bitwardenrs/server:latest
+sudo apt-get install ca-certificates curl gnupg
 ```
 
-12. Setup Caddy the reverse proxy that'll serve HTTPS, first pull latest alpine image.
-
-`sudo docker pull caddy/caddy:alpine`
-
-13. Create Caddy config
-
-`nano /etc/Caddyfile`
-
-config:
+1.3 Add Docker's official GPG key (the modern `signed-by` keyring approach — `apt-key` is deprecated and removed in current Ubuntu/Debian):
 
 ```
-example.com {
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+  -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+```
+
+1.4 Add the Docker upstream repository (architecture is detected automatically — works on amd64 and arm64):
+
+```
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] \
+  https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+```
+
+1.5 Update apt and install Docker:
+
+```
+sudo apt-get update
+sudo apt-get install docker-ce docker-ce-cli containerd.io \
+  docker-buildx-plugin docker-compose-plugin
+```
+
+1.6 Enable and start Docker, then confirm it works:
+
+```
+sudo systemctl enable --now docker
+sudo docker ps
+```
+
+---
+
+## 2. Deploy vaultwarden
+
+2.1 Pull the vaultwarden image:
+
+```
+sudo docker pull vaultwarden/server:latest
+```
+
+2.2 Create the data directory with strict permissions:
+
+```
+sudo mkdir /srv/vaultwarden
+sudo chmod go-rwx /srv/vaultwarden
+```
+
+2.3 Generate an admin token. As of recent vaultwarden versions, plain string tokens log a deprecation warning — generate an Argon2 PHC hash instead:
+
+```
+sudo docker run --rm -it vaultwarden/server /vaultwarden hash
+```
+
+You'll be prompted to enter a passphrase twice. Copy the resulting `$argon2id$...` string — that's your `ADMIN_TOKEN`.
+
+2.4 Run the vaultwarden container. Compared to the old `bitwarden_rs` setup, note that **`WEBSOCKET_ENABLED` is no longer required and the separate `:3012` port has been retired** — vaultwarden serves websockets on the main HTTP port via `/notifications/hub`:
+
+```
+docker run -d --name vaultwarden \
+  -v /srv/vaultwarden:/data \
+  -e SIGNUPS_ALLOWED=false \
+  -e ADMIN_TOKEN='$argon2id$v=19$...YOUR_HASH_HERE...' \
+  -e DOMAIN=https://YOUR_DOMAIN_HERE \
+  -p 127.0.0.1:8080:80 \
+  --restart on-failure \
+  vaultwarden/server:latest
+```
+
+The container binds to `127.0.0.1` only — Caddy (next section) is the only thing that should reach it.
+
+---
+
+## 3. Set up Caddy as a reverse proxy
+
+3.1 Pull Caddy. The canonical image is `caddy:alpine` (the old `caddy/caddy` namespace is deprecated):
+
+```
+sudo docker pull caddy:alpine
+```
+
+3.2 Create the Caddy config:
+
+```
+sudo nano /etc/Caddyfile
+```
+
+```
+YOUR_DOMAIN_HERE {
   encode gzip
-
-  # The negotiation endpoint is also proxied to Rocket
-  reverse_proxy /notifications/hub/negotiate 0.0.0.0:8080
-
-  # Notifications redirected to the websockets server
-  reverse_proxy /notifications/hub 0.0.0.0:3012
-
-  # Send all other traffic to the regular bitwarden_rs endpoint
-  reverse_proxy 0.0.0.0:8080
+  reverse_proxy 127.0.0.1:8080
 }
 ```
 
-Note: The site name you choose in this file must match the desired URL that bitwarden_rs is served under. When navigating to the web interface later in this guide, ensure that you type the same hostname chosen in this configuration file (in this example, example.com).
+The old config split traffic between `:8080` and `:3012` for websockets — that's no longer necessary in modern vaultwarden. A single `reverse_proxy` covers everything.
 
-14. Create Caddy folder
+3.3 Create the Caddy state directory and run the container:
 
 ```
 sudo mkdir /etc/caddy
 sudo chmod go-rwx /etc/caddy
+
+sudo docker run -d --name caddy \
+  -v /etc/Caddyfile:/etc/caddy/Caddyfile \
+  -v /etc/caddy:/root/.local/share/caddy \
+  --net host \
+  --restart on-failure \
+  caddy:alpine
 ```
 
-15. Create Caddy docker
+3.4 Tail the logs to watch the cert provisioning:
 
 ```
-sudo docker run -d --name caddy -v /etc/Caddyfile:/etc/caddy/Caddyfile -v /etc/caddy:/root/.local/share/caddy --net host --restart on-failure caddy/caddy:alpine
+sudo docker logs -f caddy
 ```
 
-16. view Caddy logs
+If you see ACME errors, common causes are: DNS not pointing at this host yet, ports 80/443 not open in your firewall, or rate limits from prior failed attempts. Stop and start Caddy with `sudo docker stop caddy && sudo docker start caddy` after fixing.
 
-`sudo docker logs caddy`
+3.5 Visit `https://YOUR_DOMAIN_HERE` — you should see the vaultwarden login screen.
 
-note: look for any issues such as:
+---
+
+## 4. Configure admin settings
+
+Visit `https://YOUR_DOMAIN_HERE/admin` and log in with the admin passphrase from section 2.3 (the plain passphrase, not the Argon2 hash).
+
+Recommended settings:
+
+- **General Settings** → set **Domain URL** to `https://YOUR_DOMAIN_HERE`, set an invitation org name.
+- **SMTP Email Settings** → enable, point at your provider. For Gmail, use `smtp.gmail.com:587` with TLS and an [App Password](https://myaccount.google.com/apppasswords) (your normal Google password will not work).
+- **Email 2FA Settings** → enable.
+- Click **Save**, then use **Test SMTP** to verify a delivery.
+
+> The SMTP password is stored in plaintext in `/srv/vaultwarden/config.json`. Restrict access to the data directory accordingly.
+
+---
+
+## 5. Set up offsite backups over SSH
+
+This section uses **SSH key authentication** — no plaintext passwords stored in systemd units. The original guide used `sshpass` with a hardcoded password; that approach was removed because (a) the password sat world-readable in `/etc/systemd/system/`, and (b) the unit silently failed forever the first time the remote host's keys changed (e.g. after a server rebuild) with no notification.
+
+5.1 Install sqlite3 on the vaultwarden host:
 
 ```
-    2020/02/23 05:46:19 [INFO] Unable to deactivate the authorization: <url>
-    2020/02/23 05:46:19 [ERROR][example.com] failed to obtain certificate: acme: Error -> One or more domains had a problem:
-```
-If any issues, you can stop Caddy/start Caddy with:
-
-```
-sudo docker stop caddy
-sudo docker start caddy
+sudo apt-get install sqlite3
 ```
 
-17. Test the website
-
-`https://YOUR_DOMAIN_HERE`
-
-Should see login screen.
-
-18. Configure admin settings
-
-Go to https://YOUR_DOMAIN_HERE/admin
-
-Login with the admin token from step 11.
-
-   18.1 Click on 'Settings', then 'General Settings'
-    
-   18.2 Setup the 'Domain URL': https://YOUR_DOMAIN_HERE
-        
-   18.3 Invitation organization name: example.com
-
-   18.4 Click on 'SMTP Email Settings' (note I use gmail smtp)
-    
-   18.5 'Enabled' check.
-        
-   18.6 'Host': smtp.gmail.com
-        
-   18.7 'Enable Secure SMTP' check.
-        
-   18.8 'Port': 587
-        
-   18.9 'From Address': YOUR_EMAIL_HERE@gmail.com
-        
-   18.10 'From Name': WHATEVER_NAME_YOU_WANT_HERE
-        
-   18.11 'Username': YOUR_EMAIL_HERE@gmail.com
-        
-   18.12 'Password': APP_PASSWORD_HERE Note: generated App password for gmail. https://myaccount.google.com/apppasswords
-
-
-   18.13 Click on 'Email 2FA Settings'
-    
-   18.14 'Enabled' check.
-
-   18.15 click 'save'.
-    
-   18.16 Test SMTP via the 'SMTP Email Settings', 'Test SMTP': enter your email you'd like to test sending to and see if it works.
-
-
-19. Setup backups, install sqlite3
-
-`sudo apt-get install sqlite3`
-
-20. Create a directory for backups.
+5.2 Create the local backup directory:
 
 ```
 sudo mkdir /srv/backup
 sudo chmod go-rwx /srv/backup
 ```
 
-21. Create backup service
+5.3 Generate an SSH key for `root` (the user the systemd unit runs as) if one doesn't exist:
 
-`nano /etc/systemd/system/bitwarden-backup.service`
+```
+sudo ssh-keygen -t ed25519 -f /root/.ssh/id_ed25519 -N ''
+```
 
-config: 
+5.4 Authorize the key on your offsite/backup server. Replace `BACKUP_PORT`, `BACKUP_USER`, and `BACKUP_HOST` with your values:
+
+```
+sudo ssh-copy-id -p BACKUP_PORT -i /root/.ssh/id_ed25519.pub BACKUP_USER@BACKUP_HOST
+```
+
+5.5 Seed `known_hosts` with the offsite server's keys. **Verify the fingerprint out-of-band** (e.g. by running `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` directly on the backup server) before trusting it:
+
+```
+sudo ssh-keyscan -p BACKUP_PORT BACKUP_HOST | sudo tee -a /root/.ssh/known_hosts
+sudo ssh-keygen -lf /root/.ssh/known_hosts | grep BACKUP_HOST
+```
+
+5.6 Test passwordless SSH:
+
+```
+sudo ssh -p BACKUP_PORT -o BatchMode=yes BACKUP_USER@BACKUP_HOST 'echo OK'
+```
+
+If you see `OK`, you're done. If you see `Permission denied (publickey)`, repeat 5.4. If you see `Host key verification failed`, repeat 5.5.
+
+5.7 Create the backup service:
+
+```
+sudo nano /etc/systemd/system/vaultwarden-backup.service
+```
 
 ```
 [Unit]
-Description=backup the bitwarden sqlite database
+Description=Backup the vaultwarden sqlite database
+OnFailure=vaultwarden-backup-failure@%n.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/srv/backup
-#Take backup
-ExecStart=/usr/bin/env sh -c 'sqlite3 /srv/bitwarden/db.sqlite3 ".backup backup-$(date -Is | tr : _).sq3"'
-#backup file retention 30 days.
+
+# 1. Snapshot the live database (safe to run while vaultwarden is up)
+ExecStart=/usr/bin/env sh -c 'sqlite3 /srv/vaultwarden/db.sqlite3 ".backup backup-$(date -Is | tr : _).sq3"'
+
+# 2. Prune local backups older than 30 days
 ExecStart=/usr/bin/find . -type f -mtime +30 -name 'backup*' -delete
-#Sync local backups offsite - remove this line below if you do not want to do offsite backups via SSH/SCP.
-ExecStart=/usr/bin/env sh -c 'sshpass -p "YOUR_SERVER_PASS_HERE" scp -P 22022 -r /srv/backup/ USERNAME_HERE@YOUR_SERVER_HERE:BACKUP_PATH_LOCATION_HERE'
+
+# 3. Sync to offsite host (remove this line if you don't want offsite backups)
+ExecStart=/usr/bin/scp -P BACKUP_PORT -r /srv/backup/ BACKUP_USER@BACKUP_HOST:BACKUP_REMOTE_PATH
 ```
 
-22. start backup service
+Replace `BACKUP_PORT`, `BACKUP_USER`, `BACKUP_HOST`, and `BACKUP_REMOTE_PATH` with your values. The `OnFailure=` directive is described in section 5.10 — you can omit it if you don't want notifications.
 
-`sudo systemctl start bitwarden-backup.service`
+5.8 Run the unit once and verify a backup file exists:
 
-23. Verify that a backup file is present:
+```
+sudo systemctl start vaultwarden-backup.service
+sudo ls -l /srv/backup/
+```
 
-`sudo ls -l /srv/backup/`
+You should see something like:
 
-Should see a file like example: 
+```
+-rw-r--r-- 1 root root 139264 Apr 25 18:16 backup-2026-04-25T18_16_50+00_00.sq3
+```
 
-```-rw-r--r-- 1 root root 139264 Feb 24 18:16 backup-2020-02-24T18_16_50-07_00.sq3```
+5.9 Schedule daily backups via a systemd timer:
 
-24. To schedule regular backups using this backup service unit, create the following systemd timer unit.
-
-`nano /etc/systemd/system/bitwarden-backup.timer`
-
-config:
+```
+sudo nano /etc/systemd/system/vaultwarden-backup.timer
+```
 
 ```
 [Unit]
-Description=schedule bitwarden backups
+Description=Schedule vaultwarden backups
 
 [Timer]
 OnCalendar=04:00
@@ -220,67 +263,135 @@ Persistent=true
 WantedBy=multi-user.target
 ```
 
-25. Start and enable this timer unit.
-
 ```
-sudo systemctl enable bitwarden-backup.timer
-sudo systemctl start bitwarden-backup.timer
+sudo systemctl enable --now vaultwarden-backup.timer
+sudo systemctl list-timers vaultwarden-backup.timer
 ```
 
-Should see output similar to:
-```
-  bitwarden-backup.timer - schedule bitwarden backups
-  Loaded: loaded (/etc/systemd/system/bitwarden-backup.timer; enabled; vendor preset: enabled)
-  Active: active (waiting) since Mon 2020-02-24 22:09:44 MST; 7s ago
-  Trigger: Tue 2020-02-25 04:00:00 MST; 5h 50min left
-```
-
-26. Setup SSH port to 22022
-
-    26.1 edit ssh file
-    
-    `nano /etc/sshd/sshd_config`
-
-    locate the '#Port 22' and update it to 'Port 22022'
-    
-    26.2 restart sshd
-    
-    `service sshd restart`
-    
-    26.3 reconnect to your server via port 22022 to test that it works.
-
-
-27. Setup IP tables
-
-    27.1 Install IPtables packages
-    
-    `apt-get install iptables iptables-persistent -y`
-    
-    27.2 Run iptables commands
-    
-    ```
-    iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
-    iptables -A INPUT -p udp -m multiport --dports 53 -j ACCEPT
-    iptables -A INPUT -p tcp -m multiport --dports 22022,80,443,8080 -j ACCEPT
-    iptables -P INPUT DROP
-    iptables-save > /etc/iptables/rules.v4
-    ```
-
-
-28. reboot server to see if everything comes up OK still by itself.
-
-29. validate iptables are loaded
-
-`iptables -L -v -n`
-
-Look for your rules you inserted in step 27.2.
-
-example INPUT chain:
+5.10 (Optional but strongly recommended) Add a failure-notification handler. The `OnFailure=` line in the service unit triggers a templated unit when the backup fails. Create it once:
 
 ```
-Chain INPUT (policy DROP 1181 packets, 65075 bytes)
- pkts bytes target     prot opt in     out     source               destination
- 135K   68M ACCEPT     all  --  *      *       0.0.0.0/0            0.0.0.0/0            state RELATED,ESTABLISHED
-   72  4921 ACCEPT     udp  --  *      *       0.0.0.0/0            0.0.0.0/0            multiport dports 53
-10394  617K ACCEPT     tcp  --  *      *       0.0.0.0/0            0.0.0.0/0            multiport dports 22022,80,443,8080
+sudo nano /etc/systemd/system/vaultwarden-backup-failure@.service
 ```
+
+```
+[Unit]
+Description=Notify on failure of %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -sS -d "vaultwarden backup failed on $(hostname)" https://ntfy.sh/YOUR_PRIVATE_TOPIC
+```
+
+Swap in any notification mechanism you prefer (ntfy, Discord webhook, email via `mail`, Slack, etc.). Without this, a broken backup is invisible until you happen to check `systemctl status` — which is exactly how the original guide's setup tended to silently rot.
+
+---
+
+## 6. Restoring from backup
+
+vaultwarden uses SQLite's online backup format, so restore is a file copy:
+
+```
+# Stop the container so nothing is writing to the database
+sudo docker stop vaultwarden
+
+# Replace the live DB with the backup snapshot
+sudo cp /srv/vaultwarden/db.sqlite3 /srv/vaultwarden/db.sqlite3.broken
+sudo cp /srv/backup/backup-YYYY-MM-DDT....sq3 /srv/vaultwarden/db.sqlite3
+sudo chown root:root /srv/vaultwarden/db.sqlite3
+
+# Start vaultwarden
+sudo docker start vaultwarden
+```
+
+The data directory `/srv/vaultwarden` also contains `attachments/`, `sends/`, `rsa_key.*`, and `config.json` — for a full disaster-recovery copy, archive the entire directory. The backup unit above only captures the SQLite database; consider extending it with a `tar` of the data directory if attachments matter to you.
+
+---
+
+## 7. Harden SSH on the vaultwarden host
+
+7.1 Move SSH off port 22:
+
+```
+sudo nano /etc/ssh/sshd_config
+```
+
+(Note: the path is `/etc/ssh/sshd_config`, not `/etc/sshd/sshd_config` — the original guide had this wrong.)
+
+Find `#Port 22` and change it to `Port 22022`.
+
+7.2 Restart sshd:
+
+```
+sudo systemctl restart ssh
+```
+
+7.3 Reconnect on the new port from a second terminal **before closing your current session** — if the new port doesn't work, you'll need the old session to fix it.
+
+```
+ssh -p 22022 user@your-vaultwarden-host
+```
+
+> **Important:** the `BACKUP_PORT` from section 5 is the SSH port on your **backup target** server, which is unrelated to this host's SSH port. Don't confuse them.
+
+---
+
+## 8. Firewall (iptables)
+
+8.1 Install iptables-persistent:
+
+```
+sudo apt-get install iptables iptables-persistent -y
+```
+
+8.2 Apply the rules. Note that we **do not open port 8080**: the vaultwarden container binds to `127.0.0.1:8080` only, so it's never reachable from outside regardless of firewall rules. Caddy (host network mode) handles 80/443.
+
+```
+sudo iptables -A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT
+sudo iptables -A INPUT -i lo -j ACCEPT
+sudo iptables -A INPUT -p udp -m multiport --dports 53 -j ACCEPT
+sudo iptables -A INPUT -p tcp -m multiport --dports 22022,80,443 -j ACCEPT
+sudo iptables -P INPUT DROP
+sudo iptables-save | sudo tee /etc/iptables/rules.v4 > /dev/null
+```
+
+8.3 Reboot to verify everything comes up cleanly:
+
+```
+sudo reboot
+```
+
+8.4 Validate rules after reboot:
+
+```
+sudo iptables -L -v -n
+```
+
+If you'd rather use `ufw`, the equivalent is:
+
+```
+sudo ufw default deny incoming
+sudo ufw allow 22022/tcp
+sudo ufw allow 80,443/tcp
+sudo ufw enable
+```
+
+---
+
+## Troubleshooting
+
+**Backup unit fails with `Host key verification failed` after rebuilding the backup server.**
+The remote host's SSH keys regenerated and no longer match `/root/.ssh/known_hosts`. Refresh:
+
+```
+sudo ssh-keygen -f /root/.ssh/known_hosts -R '[BACKUP_HOST]:BACKUP_PORT'
+sudo ssh-keyscan -p BACKUP_PORT BACKUP_HOST | sudo tee -a /root/.ssh/known_hosts
+# Verify the new fingerprint matches what's on the backup server before trusting it
+sudo systemctl start vaultwarden-backup.service
+```
+
+**`vaultwarden` container exits immediately with admin-token warnings.**
+Recent versions reject plain-string tokens. Generate an Argon2 hash per section 2.3 and pass that as `ADMIN_TOKEN`.
+
+**Caddy can't reach vaultwarden.**
+The container binds to `127.0.0.1:8080`. Caddy must run with `--net host` (as in section 3.3) to reach it. If you run Caddy in a bridge network instead, swap to a docker network shared with the vaultwarden container and reference it by container name.
