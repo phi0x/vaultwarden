@@ -1,0 +1,13 @@
+# Local secrets and per-host config
+.env
+Caddyfile
+
+# Local data (vaultwarden bind-mounts to /srv/vaultwarden by default; this
+# only matters if you change compose.yaml to use a relative ./data path)
+data/
+
+# OS / editor noise
+.DS_Store
+*.swp
+.idea/
+.vscode/

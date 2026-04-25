@@ -1,0 +1,64 @@
+# compose.yaml — vaultwarden + Caddy reference stack
+#
+# Quick start:
+#   1.  cp .env.example .env             # then edit, generate the admin token (see README §2)
+#   2.  cp Caddyfile.example Caddyfile   # then replace YOUR_DOMAIN_HERE
+#   3.  docker compose up -d
+#   4.  docker compose logs -f caddy     # watch the cert provisioning on first boot
+#
+# Vaultwarden's data lives at /srv/vaultwarden on the host so the offsite
+# backup unit (README §4) can read it without juggling compose paths. Caddy's
+# state lives in named volumes — Caddy's certs and config cache are opaque
+# state that doesn't need to leak into your filesystem.
+#
+# Pin the vaultwarden image tag (e.g. `:1.32.7`) in production. `:latest`
+# is fine for personal/home use as long as you read the changelog before
+# `docker compose pull && docker compose up -d`.
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: unless-stopped
+    volumes:
+      - /srv/vaultwarden:/data
+    environment:
+      SIGNUPS_ALLOWED: "false"
+      ADMIN_TOKEN: ${VAULTWARDEN_ADMIN_TOKEN}
+      DOMAIN: ${DOMAIN}
+      # Trust the X-Forwarded-* headers from Caddy so vaultwarden logs the
+      # real client IP and rate-limits per-source instead of per-proxy.
+      IP_HEADER: X-Real-IP
+    healthcheck:
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 60s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - vaultwarden_net
+
+  caddy:
+    image: caddy:alpine
+    container_name: caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - vaultwarden_net
+    depends_on:
+      - vaultwarden
+
+networks:
+  vaultwarden_net:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
