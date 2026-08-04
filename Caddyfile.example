@@ -17,6 +17,12 @@
 #   4. The web vault requests sourcemaps that vaultwarden doesn't ship; the
 #      *.map 404 rule keeps DevTools quiet without 404s in the access log.
 #
+#   5. Caddy serves HTTP/3 by default and advertises it via Alt-Svc on every
+#      response. That advertisement is a promise: if UDP 443 doesn't actually
+#      reach Caddy, clients stall on a QUIC timeout before falling back to TCP.
+#      Publishing `443:443/udp` (compose.yaml) is only half of it — your cloud
+#      provider's firewall must allow UDP 443 too. See README §7.5.
+#
 # Replace YOUR_DOMAIN_HERE with your actual hostname.
 
 YOUR_DOMAIN_HERE {
@@ -67,10 +73,17 @@ YOUR_DOMAIN_HERE {
             Permissions-Policy "geolocation=(self), microphone=(), camera=(), payment=(self), usb=(), fullscreen=(self)"
         }
 
-        # Notifications/websocket endpoint — explicit for clarity; modern
-        # vaultwarden serves it on the main port, so this is functionally
-        # the same as the catch-all below but documents the intent.
-        reverse_proxy /notifications/hub* vaultwarden:80
+        # Notifications/websocket endpoint. Modern vaultwarden serves it on the
+        # main port, so this routes to the same upstream as the catch-all — but
+        # it must repeat the header_up lines. A reverse_proxy directive does not
+        # inherit them, and because this route matches first, omitting them makes
+        # vaultwarden log every websocket as coming from the Caddy container:
+        #   Accepting Rocket WS connection from 172.x.x.x
+        # which also defeats per-source rate limiting and fail2ban on that path.
+        reverse_proxy /notifications/hub* vaultwarden:80 {
+            header_up X-Real-IP {http.request.remote.host}
+            header_up X-Forwarded-For {http.request.remote.host}
+        }
 
         reverse_proxy vaultwarden:80 {
             header_up X-Real-IP {http.request.remote.host}
