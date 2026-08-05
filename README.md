@@ -15,6 +15,49 @@ Originally adapted from the [Linode self-hosting guide](https://www.linode.com/d
 | [`.env.example`](.env.example) | Template for the admin token and domain. Copy to `.env` and edit (gitignored). |
 | [`.gitignore`](.gitignore) | Excludes `.env`, `Caddyfile`, and local data so secrets never get committed. |
 
+## Architecture
+
+Two containers on a private Docker network. Only Caddy publishes ports; vaultwarden is
+never reachable from outside the host, so a misconfigured host firewall cannot expose it.
+
+```
+                     :80  (redirects to :443)
+   Internet  ─────>  :443/tcp   HTTP/1.1 + HTTP/2       ┌─────────┐
+                     :443/udp   HTTP/3 (QUIC)     ─────>│  Caddy  │
+                                                        └────┬────┘
+       cloud firewall + host firewall must                   │  vaultwarden_net
+       both allow all three (README §7)                      │  (bridge, internal)
+                                                             v
+                                                     ┌──────────────┐
+                                                     │  vaultwarden │  :80, unpublished
+                                                     └──────┬───────┘
+                                                            │  bind mount
+                                                            v
+                                                    /srv/vaultwarden
+                                          db.sqlite3, rsa_key.pem, config.json,
+                                          attachments/, sends/, icon_cache/
+```
+
+**What Caddy is responsible for:** terminating TLS and provisioning certificates over
+ACME automatically; forwarding the real client IP as `X-Real-IP` (vaultwarden's
+diagnostics page checks this, and it drives per-source rate limiting); applying security
+headers, while carving out the 2FA/WebAuthn endpoints that break under strict framing
+rules; and proxying the `/notifications/hub` websocket used to push vault changes to
+connected clients.
+
+**What lives where:** all vaultwarden state is files under `/srv/vaultwarden` — there is
+no external database. `db.sqlite3` is the vault, `rsa_key.pem` signs auth tokens, and
+`config.json` holds anything saved through the admin panel. Backups (§4) therefore only
+need to capture that directory. Caddy's certificate store lives in a named volume, since
+it is opaque state you never edit by hand.
+
+**Two things that bite people,** both documented below because neither fails loudly:
+
+- `config.json` **overrides environment variables**, so admin-panel settings silently win
+  over `.env` (§3).
+- Caddy advertises HTTP/3 on every response whether or not UDP 443 actually reaches it,
+  which manifests as clients hanging for a minute and then working (§7.5, Troubleshooting).
+
 ---
 
 ## 1. Install Docker
@@ -139,7 +182,53 @@ Recommended settings:
 - Click **Save**, then use **Test SMTP** to verify a delivery.
 - **Diagnostics** → all rows green. If `Reverse Proxy IP` reports the Caddy container's IP instead of your real client IP, the `X-Real-IP` header pass-through in Caddyfile isn't working — re-check section 2.5.
 
-> The SMTP password is stored in plaintext in `/srv/vaultwarden/config.json`. Restrict access to the data directory accordingly.
+> **`config.json` silently overrides your environment.** Anything you save in the admin
+> panel is written to `/srv/vaultwarden/config.json`, and that file takes precedence over
+> environment variables. Setting **Domain URL** above writes `domain` into it, which from
+> then on shadows `DOMAIN` from `.env` — the container announces this at every startup:
+>
+> ```
+> [WARNING] The following environment variables are being overridden by the config.json file.
+> [WARNING] DOMAIN, SIGNUPS_ALLOWED, ADMIN_TOKEN, IP_HEADER
+> ```
+>
+> It is easy to miss, and it means edits to `.env` appear to do nothing. To make the
+> environment authoritative again, delete the offending keys from `config.json` and
+> restart. Check the values match first — a mismatched `admin_token` hash will change
+> your admin passphrase:
+>
+> ```
+> docker compose down
+> jq 'del(.domain, .signups_allowed, .admin_token, .ip_header)' \
+>    /srv/vaultwarden/config.json > /tmp/c && mv /tmp/c /srv/vaultwarden/config.json
+> docker compose up -d          # the WARNING block should be gone
+> ```
+
+> **The SMTP password is stored in plaintext in `/srv/vaultwarden/config.json`**, which
+> is created world-readable. On a host with other user accounts, that is a real exposure —
+> `chmod 600` it and restrict the data directory.
+>
+> To keep the credential out of that file entirely, pass SMTP through the environment
+> instead and delete the `smtp_*` keys from `config.json` (they win otherwise):
+>
+> ```yaml
+> # compose.yaml, vaultwarden service
+> SMTP_HOST: ${SMTP_HOST}
+> SMTP_PORT: ${SMTP_PORT}
+> SMTP_SECURITY: ${SMTP_SECURITY}
+> SMTP_FROM: ${SMTP_FROM}
+> SMTP_USERNAME: ${SMTP_USERNAME}
+> SMTP_PASSWORD: ${SMTP_PASSWORD}
+> ```
+>
+> Then `jq 'del(.smtp_host, .smtp_port, .smtp_security, .smtp_from, .smtp_from_name,
+> .smtp_username, .smtp_password, .smtp_timeout)' …` and restart. Note the tradeoff: with
+> `smtp_*` absent from `config.json`, **saving the Mail section in the admin panel writes
+> them straight back** and re-plants the password. Change mail settings in `.env` from
+> then on. Quote values in `.env` (`SMTP_PASSWORD='...'`) so Compose does not interpolate
+> a `$`, and remember that `docker restart` will **not** pick up an `.env` change —
+> environment is fixed at container creation, so use
+> `docker compose up -d --force-recreate`.
 
 ---
 
@@ -359,6 +448,52 @@ sudo ufw allow 443/udp
 sudo ufw enable
 ```
 
+7.5 **If you are on a cloud VPS, the host firewall is not the only firewall.** Oracle Cloud
+(VCN security lists / NSGs), AWS (security groups), GCP and Azure all filter traffic
+*before* it reaches the instance, and their defaults typically allow TCP 443 but **not
+UDP 443**. The symptom is nasty because nothing looks broken: TCP works, the site loads,
+certificates renew — but Caddy advertises HTTP/3 on every response, clients try QUIC,
+and those packets are dropped in silence. See the Troubleshooting entry *"Clients stall
+for a minute, then work"*.
+
+Add an ingress rule for **UDP 443 from 0.0.0.0/0** in your provider's console to match
+the host rules above. Verify from outside the instance:
+
+```
+# Confirms UDP/443 reaches Caddy end-to-end. See the Troubleshooting section for a
+# probe that works without an HTTP/3-capable curl.
+curl --http3-only -sSo /dev/null -w '%{http_version}\n' https://YOUR_DOMAIN_HERE/
+```
+
+> On Oracle Cloud specifically, the public IP is NAT'd at the edge and is not present on
+> any host interface (`ip addr` shows only the private VNIC address). Traffic to it still
+> routes out via the virtual router and hairpins back, so probing your own public IP
+> *from the instance* is a valid test of a security-list rule — you do not need an
+> external vantage point.
+
+7.6 **Raise the UDP buffer limits for HTTP/3.** The kernel default (208 KiB) is far below
+what QUIC wants, and Caddy will log this at every start:
+
+```
+failed to sufficiently increase receive buffer size (was: 208 kiB, wanted: 7168 kiB, got: 416 kiB)
+```
+
+It is not fatal, but it caps QUIC throughput and causes packet loss under load. Fix it
+persistently:
+
+```
+sudo tee /etc/sysctl.d/99-quic-buffers.conf > /dev/null <<'EOF'
+net.core.rmem_max = 8388608
+net.core.wmem_max = 8388608
+EOF
+sudo sysctl -p /etc/sysctl.d/99-quic-buffers.conf
+docker compose restart caddy    # sockets take the new limit at creation
+```
+
+These sysctls are not network-namespaced on current kernels, so the container inherits
+them — no `sysctls:` block is needed in `compose.yaml`. Confirm the warning is gone with
+`docker compose logs caddy | grep -i buffer`.
+
 ---
 
 ## Appendix A: Manual deployment without Docker Compose
@@ -431,3 +566,65 @@ The `vaultwarden:80` reference in `Caddyfile` resolves only when both containers
 
 **`/admin/diagnostics` shows `Reverse Proxy IP: 172.x.x.x` instead of my real IP.**
 The `X-Real-IP` header isn't reaching vaultwarden. Confirm `Caddyfile` includes `header_up X-Real-IP {http.request.remote.host}` (it does in the example), and that `IP_HEADER: X-Real-IP` is set in the vaultwarden environment (it is in `compose.yaml`).
+
+**Clients stall for a minute, then work — browser extension opens blank, fills in after a long pause, and does it again next time.**
+Caddy enables HTTP/3 by default and advertises it on *every* response:
+
+```
+alt-svc: h3=":443"; ma=2592000
+```
+
+Browsers cache that for 30 days and try QUIC first. If UDP 443 does not actually reach
+Caddy, those packets vanish and the client waits out a QUIC timeout before falling back
+to TCP — on every fresh connection. Server-side timings look perfect throughout
+(`/api/sync` in tens of milliseconds), which is what makes it so misleading. It hits
+some devices and not others, depending on network path and what each client has cached.
+
+Two things must both be true. Check the publish first:
+
+```
+docker compose port caddy 443     # must list a udp mapping, not just tcp
+sudo iptables -t nat -S | grep 'dport 443'   # expect a -p udp DNAT rule alongside -p tcp
+```
+
+A `ports: - "443:443"` entry in `compose.yaml` is **TCP only** — `- "443:443/udp"` is a
+separate line (present in this repo's `compose.yaml`). Then confirm the cloud firewall
+allows UDP 443 (section 7.5), which is the more commonly missed half.
+
+To test the path when your `curl` lacks HTTP/3 (`curl -V | grep -q HTTP3 || echo "no h3"`),
+send a QUIC packet with a deliberately unknown version — any working QUIC server must
+answer with a Version Negotiation packet, and a timeout means the path is black-holed:
+
+```python
+# quic-probe.py YOUR_HOST — prints ALIVE or TIMEOUT
+import socket, struct, sys
+p  = b'\xc0' + b'\x1a\x2a\x3a\x4a'                       # long header, unknown version
+p += b'\x08' + b'\xde\xad\xbe\xef\xca\xfe\xba\xbe'       # DCID
+p += b'\x08' + b'\x01\x02\x03\x04\x05\x06\x07\x08'       # SCID
+p += b'\x00'; p += b'\x00' * (1200 - len(p))             # token len + pad to 1200
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+try:
+    s.sendto(p, (sys.argv[1], 443)); d, _ = s.recvfrom(2048)
+except socket.timeout:
+    print("TIMEOUT - UDP 443 is black-holed"); raise SystemExit(1)
+print("ALIVE - Version Negotiation" if d[0] & 0x80 and struct.unpack('>I', d[1:5])[0] == 0
+      else f"replied {len(d)} bytes")
+```
+
+Run it against the container IP, the host IP, and the public IP in turn — the first one
+that times out tells you which hop is dropping the packets.
+
+If you would rather not run HTTP/3 at all, disable it instead of publishing UDP, so
+Caddy stops advertising what it cannot serve. Add to the top of your `Caddyfile`:
+
+```
+{
+    servers {
+        protocols h1 h2
+    }
+}
+```
+
+Note that clients which already cached the `Alt-Svc` entry may keep probing QUIC until it
+expires or they mark it broken, so fixing the UDP path gives faster relief than
+withdrawing the advertisement.
