@@ -88,26 +88,39 @@ YOUR_DOMAIN_HERE {
         }
     }
 
-    # All other traffic
+    # All other traffic.
+    #
+    # There is deliberately NO `header` block here. vaultwarden sets
+    # X-Frame-Options, Permissions-Policy, X-Content-Type-Options and its own CSP
+    # on every response it serves, so anything set here is at best a duplicate
+    # and at worst actively harmful:
+    #
+    #   Content-Security-Policy — two CSP headers on one response are enforced by
+    #     the browser as the INTERSECTION of both, so a policy set here can only
+    #     ever subtract from vaultwarden's. The obvious-looking
+    #       default-src 'self'; style-src ...; img-src ...; connect-src ...
+    #     declares no script-src, so script-src falls back to default-src 'self',
+    #     dropping 'wasm-unsafe-eval'. The 2026.x web vault runs its crypto in a
+    #     WebAssembly SDK and Chromium refuses to compile WASM without that
+    #     source, so unlock hangs on the spinner with no error and clean server
+    #     logs. vaultwarden's own policy is stricter (default-src 'none'),
+    #     allow-lists api.pwnedpasswords.com / api.2fa.directory / the
+    #     alias-forwarding APIs, carries frame-ancestors for the browser
+    #     extensions, and tracks each bundled web-vault release. Never re-add.
+    #
+    #   X-Frame-Options — vaultwarden already sends SAMEORIGIN on every path it
+    #     serves (verified incl. /admin, /api/*, /icons/*, static assets and
+    #     error responses). A second identical header is noise, and on the app
+    #     index vaultwarden's CSP carries frame-ancestors, which per spec makes
+    #     browsers ignore X-Frame-Options entirely.
+    #
+    #   Permissions-Policy — vaultwarden's denies geolocation, payment and
+    #     fullscreen outright. A hand-written one here typically allows them for
+    #     'self', which is strictly weaker; the vault UI uses none of them.
+    #
+    # Headers vaultwarden does NOT send — notably HSTS — belong in the site-level
+    # `header` block above, which also covers responses Caddy generates itself.
     handle {
-        header {
-            X-Frame-Options "SAMEORIGIN"
-            # Do NOT add a Content-Security-Policy here. Two CSP headers on one
-            # response are intersected by the browser, and vaultwarden already
-            # sends a good one. A policy like
-            #   default-src 'self'; style-src ...; img-src ...; connect-src ...
-            # looks harmless but declares no script-src, so script-src falls back
-            # to default-src 'self' — which drops 'wasm-unsafe-eval' from
-            # vaultwarden's policy. The 2026.x web vault runs its crypto in a
-            # WebAssembly SDK, Chromium refuses to compile WASM without that
-            # source, and unlock then hangs on the spinner with no visible error.
-            # vaultwarden's own CSP is stricter (default-src 'none'), allow-lists
-            # api.pwnedpasswords.com / api.2fa.directory / the alias-forwarding
-            # APIs, sets frame-ancestors for the browser extensions, and is kept
-            # in sync with each bundled web-vault release upstream. Let it pass.
-            Permissions-Policy "geolocation=(self), microphone=(), camera=(), payment=(self), usb=(), fullscreen=(self)"
-        }
-
         # Notifications/websocket endpoint. Modern vaultwarden serves it on the
         # main port, so this routes to the same upstream as the catch-all — but
         # it must repeat the header_up lines. A reverse_proxy directive does not
