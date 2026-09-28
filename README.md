@@ -51,12 +51,15 @@ no external database. `db.sqlite3` is the vault, `rsa_key.pem` signs auth tokens
 need to capture that directory. Caddy's certificate store lives in a named volume, since
 it is opaque state you never edit by hand.
 
-**Two things that bite people,** both documented below because neither fails loudly:
+**Three things that bite people,** all documented below because none of them fail loudly:
 
 - `config.json` **overrides environment variables**, so admin-panel settings silently win
   over `.env` (§3).
 - Caddy advertises HTTP/3 on every response whether or not UDP 443 actually reaches it,
   which manifests as clients hanging for a minute and then working (§7.5, Troubleshooting).
+- Setting a `Content-Security-Policy` in Caddy **intersects** with the one vaultwarden
+  already sends, so it can only subtract. Do it and the web vault hangs on the unlock
+  spinner (Troubleshooting).
 
 ---
 
@@ -566,6 +569,56 @@ The `vaultwarden:80` reference in `Caddyfile` resolves only when both containers
 
 **`/admin/diagnostics` shows `Reverse Proxy IP: 172.x.x.x` instead of my real IP.**
 The `X-Real-IP` header isn't reaching vaultwarden. Confirm `Caddyfile` includes `header_up X-Real-IP {http.request.remote.host}` (it does in the example), and that `IP_HEADER: X-Real-IP` is set in the vaultwarden environment (it is in `compose.yaml`).
+
+**Web vault accepts the master password, then spins forever and never decrypts.**
+Your reverse proxy is setting its own `Content-Security-Policy`. When a response carries
+more than one CSP header, the browser enforces the **intersection** — a resource must be
+allowed by *every* policy — so a header added in Caddy can only subtract from the one
+vaultwarden sends. The usual culprit declares no `script-src`:
+
+```
+default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src ...
+```
+
+`script-src` then falls back to `default-src 'self'`, which does not include
+`'wasm-unsafe-eval'`. The 2026.x web vault performs all crypto in a WebAssembly SDK
+(a ~7 MB `.module.wasm`), and Chromium refuses to compile WASM without that source.
+Unlock dies at the WASM boundary and the UI shows no error — just the spinner. Server
+logs stay clean the whole time, every request 200 in tens of milliseconds, which is what
+sends people hunting for a timeout that isn't there.
+
+Count the headers — there must be exactly one, and it must carry `wasm-unsafe-eval`:
+
+```
+curl -sSI https://YOUR_DOMAIN_HERE/ | grep -ci '^content-security-policy'   # must print 1
+curl -sSI https://YOUR_DOMAIN_HERE/ | grep -i  'wasm-unsafe-eval'           # must match
+```
+
+If the count is 2, delete the CSP from your proxy config (this repo's `Caddyfile.example`
+has none, by design) and reload. vaultwarden's own policy is the stricter of the two —
+`default-src 'none'`, correct `frame-ancestors` for the browser extensions, `frame-src`
+for Duo — and it tracks each bundled web-vault release, so it is also less to maintain.
+
+**Extension or desktop app fails right after a client auto-update — empty vault, "invalid master password", or `Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid`.**
+Two different causes, in this order.
+
+First, check the server is new enough. Client and server are tightly coupled as of 2026:
+clients ≥ `2026.7.0` need vaultwarden ≥ `1.37.0`, and clients ≥ `2026.8.0` need
+≥ `1.37.2`. An old server against a new client throws SDK deserialization errors:
+
+```
+docker compose exec vaultwarden /vaultwarden --version
+```
+
+If the server is current, it is the client's **local** state, not your vault. The
+`TextDecoder` failure appears right after the client migrates its own state schema, at
+`Getting the WrappedLocalUserDataKey from state` — it is reading back something it just
+wrote and cannot decode. Tell-tale sign: the same account works in one browser and fails
+in another against the same server. Fully log out and log back in; if that doesn't take,
+clear the extension's local storage or reinstall it. Nothing to fix server-side — and
+since this is local state, a working client elsewhere is good evidence your vault data
+is intact. See [vaultwarden#7530](https://github.com/dani-garcia/vaultwarden/issues/7530)
+and [discussion #7615](https://github.com/dani-garcia/vaultwarden/discussions/7615).
 
 **Clients stall for a minute, then work — browser extension opens blank, fills in after a long pause, and does it again next time.**
 Caddy enables HTTP/3 by default and advertises it on *every* response:

@@ -10,9 +10,11 @@
 #      X-Frame-Options and frame-ancestors CSPs break those popups, so the
 #      @twofa matcher strips those headers ONLY on the 2FA endpoints.
 #
-#   3. The default web vault calls out to https://api.pwnedpasswords.com
-#      (breach checks) and https://api.2fa.directory (the 2FA service catalog).
-#      The CSP allow-lists those exact origins.
+#   3. There is deliberately NO Content-Security-Policy set here. vaultwarden
+#      already sends its own, and when a response carries two CSP headers the
+#      browser enforces the INTERSECTION of both — so a header added here can
+#      only ever subtract from vaultwarden's policy, never loosen it. Setting
+#      one is how you break the web vault. See the `handle` block below.
 #
 #   4. The web vault requests sourcemaps that vaultwarden doesn't ship; the
 #      *.map 404 rule keeps DevTools quiet without 404s in the access log.
@@ -69,7 +71,19 @@ YOUR_DOMAIN_HERE {
     handle {
         header {
             X-Frame-Options "SAMEORIGIN"
-            Content-Security-Policy "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://api.pwnedpasswords.com https://api.2fa.directory"
+            # Do NOT add a Content-Security-Policy here. Two CSP headers on one
+            # response are intersected by the browser, and vaultwarden already
+            # sends a good one. A policy like
+            #   default-src 'self'; style-src ...; img-src ...; connect-src ...
+            # looks harmless but declares no script-src, so script-src falls back
+            # to default-src 'self' — which drops 'wasm-unsafe-eval' from
+            # vaultwarden's policy. The 2026.x web vault runs its crypto in a
+            # WebAssembly SDK, Chromium refuses to compile WASM without that
+            # source, and unlock then hangs on the spinner with no visible error.
+            # vaultwarden's own CSP is stricter (default-src 'none'), allow-lists
+            # api.pwnedpasswords.com / api.2fa.directory / the alias-forwarding
+            # APIs, sets frame-ancestors for the browser extensions, and is kept
+            # in sync with each bundled web-vault release upstream. Let it pass.
             Permissions-Policy "geolocation=(self), microphone=(), camera=(), payment=(self), usb=(), fullscreen=(self)"
         }
 
