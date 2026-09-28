@@ -59,7 +59,10 @@ it is opaque state you never edit by hand.
   which manifests as clients hanging for a minute and then working (§7.5, Troubleshooting).
 - Setting a `Content-Security-Policy` in Caddy **intersects** with the one vaultwarden
   already sends, so it can only subtract. Do it and the web vault hangs on the unlock
-  spinner (Troubleshooting).
+  spinner (Troubleshooting). More generally, vaultwarden sets `X-Frame-Options`,
+  `Permissions-Policy`, `X-Content-Type-Options` and its CSP on everything it serves,
+  so the proxy should only add headers vaultwarden does *not* send — HSTS being the
+  one that matters.
 
 ---
 

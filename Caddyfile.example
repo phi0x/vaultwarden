@@ -6,9 +6,13 @@
 #      that you're forwarding the real client IP via X-Real-IP / X-Forwarded-For
 #      and that proxy timeouts are sane. This config makes those green.
 #
-#   2. The web vault embeds 2FA / FIDO2 challenges in popups. Strict
-#      X-Frame-Options and frame-ancestors CSPs break those popups, so the
-#      @twofa matcher strips those headers ONLY on the 2FA endpoints.
+#   2. The web vault and the browser extensions load the WebAuthn / Duo / SSO
+#      connector pages in an IFRAME. vaultwarden deliberately sends no framing
+#      headers on those pages (it applies X-Frame-Options and its CSP to
+#      everything else), so any X-Frame-Options the proxy adds becomes the only
+#      policy on them -- and SAMEORIGIN blocks the extension, whose origin is
+#      chrome-extension://..., from framing them. The @framed_connectors matcher
+#      routes them past the header block. See that block for the full list.
 #
 #   3. There is deliberately NO Content-Security-Policy set here. vaultwarden
 #      already sends its own, and when a response carries two CSP headers the
@@ -47,46 +51,76 @@ YOUR_DOMAIN_HERE {
         Referrer-Policy "same-origin"
     }
 
-    # 2FA / FIDO2 endpoints — popups need to be embeddable, so strip the
-    # framing restrictions that the default `handle` block applies.
-    @twofa {
-        path /identity/connect/two-factor*
-        path /identity/connect/two-factor-challenge*
+    # Connector pages the web vault and the browser extensions load in an IFRAME
+    # during WebAuthn / Duo / SSO.
+    #
+    # vaultwarden serves these as static files and sends NO framing headers on
+    # them, by design, so that they can be framed. That means the
+    # `X-Frame-Options: SAMEORIGIN` set by the catch-all `handle` below would be
+    # the only policy on them, and SAMEORIGIN blocks the browser extension
+    # (origin chrome-extension://...) from framing them -- extension-driven 2FA
+    # then stalls with no useful error.
+    #
+    # Giving them their own `handle` short-circuits the catch-all so that header
+    # is never applied. THAT is the mechanism; the strip below removes nothing
+    # today and is only a guard in case vaultwarden starts sending one.
+    #
+    # Irrelevant to TOTP and email 2FA, which are plain form posts with no
+    # iframe. Keep it anyway so enabling WebAuthn or Duo later just works.
+    #
+    # Do not add `-Content-Security-Policy` here. vaultwarden sends no CSP on
+    # these paths, so it strips nothing -- and if a future release does start
+    # sending one it will carry the correct frame-ancestors, which you want.
+    @framed_connectors {
         path /webauthn-connector.html
+        path /webauthn-fallback-connector.html
+        path /webauthn-mobile-connector.html
+        path /duo-redirect-connector.html
+        path /sso-connector.html
         path /identity/2fa-connector*
     }
 
-    handle @twofa {
+    handle @framed_connectors {
         header -X-Frame-Options
-        header -Content-Security-Policy
         reverse_proxy vaultwarden:80 {
             header_up X-Real-IP {http.request.remote.host}
             header_up X-Forwarded-For {http.request.remote.host}
-            header_down -X-Frame-Options
-            header_down -Content-Security-Policy
         }
     }
 
-    # All other traffic
+    # All other traffic.
+    #
+    # There is deliberately NO `header` block here. vaultwarden sets
+    # X-Frame-Options, Permissions-Policy, X-Content-Type-Options and its own CSP
+    # on every response it serves, so anything set here is at best a duplicate
+    # and at worst actively harmful:
+    #
+    #   Content-Security-Policy — two CSP headers on one response are enforced by
+    #     the browser as the INTERSECTION of both, so a policy set here can only
+    #     ever subtract from vaultwarden's. The obvious-looking
+    #       default-src 'self'; style-src ...; img-src ...; connect-src ...
+    #     declares no script-src, so script-src falls back to default-src 'self',
+    #     dropping 'wasm-unsafe-eval'. The 2026.x web vault runs its crypto in a
+    #     WebAssembly SDK and Chromium refuses to compile WASM without that
+    #     source, so unlock hangs on the spinner with no error and clean server
+    #     logs. vaultwarden's own policy is stricter (default-src 'none'),
+    #     allow-lists api.pwnedpasswords.com / api.2fa.directory / the
+    #     alias-forwarding APIs, carries frame-ancestors for the browser
+    #     extensions, and tracks each bundled web-vault release. Never re-add.
+    #
+    #   X-Frame-Options — vaultwarden already sends SAMEORIGIN on every path it
+    #     serves (verified incl. /admin, /api/*, /icons/*, static assets and
+    #     error responses). A second identical header is noise, and on the app
+    #     index vaultwarden's CSP carries frame-ancestors, which per spec makes
+    #     browsers ignore X-Frame-Options entirely.
+    #
+    #   Permissions-Policy — vaultwarden's denies geolocation, payment and
+    #     fullscreen outright. A hand-written one here typically allows them for
+    #     'self', which is strictly weaker; the vault UI uses none of them.
+    #
+    # Headers vaultwarden does NOT send — notably HSTS — belong in the site-level
+    # `header` block above, which also covers responses Caddy generates itself.
     handle {
-        header {
-            X-Frame-Options "SAMEORIGIN"
-            # Do NOT add a Content-Security-Policy here. Two CSP headers on one
-            # response are intersected by the browser, and vaultwarden already
-            # sends a good one. A policy like
-            #   default-src 'self'; style-src ...; img-src ...; connect-src ...
-            # looks harmless but declares no script-src, so script-src falls back
-            # to default-src 'self' — which drops 'wasm-unsafe-eval' from
-            # vaultwarden's policy. The 2026.x web vault runs its crypto in a
-            # WebAssembly SDK, Chromium refuses to compile WASM without that
-            # source, and unlock then hangs on the spinner with no visible error.
-            # vaultwarden's own CSP is stricter (default-src 'none'), allow-lists
-            # api.pwnedpasswords.com / api.2fa.directory / the alias-forwarding
-            # APIs, sets frame-ancestors for the browser extensions, and is kept
-            # in sync with each bundled web-vault release upstream. Let it pass.
-            Permissions-Policy "geolocation=(self), microphone=(), camera=(), payment=(self), usb=(), fullscreen=(self)"
-        }
-
         # Notifications/websocket endpoint. Modern vaultwarden serves it on the
         # main port, so this routes to the same upstream as the catch-all — but
         # it must repeat the header_up lines. A reverse_proxy directive does not
